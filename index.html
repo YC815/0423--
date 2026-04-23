@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>卡牌召喚</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700;900&family=Cinzel+Decorative:wght@700&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0f;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+      font-family: 'Noto Serif TC', serif;
+    }
+    #game-container canvas { display: block; }
+
+    /* ── BGM 音量控制組件（覆蓋在 canvas 上）── */
+    #bgm-panel {
+      position: absolute;
+      display: none;
+      align-items: center;
+      gap: 10px;
+      background: rgba(10, 5, 30, 0.82);
+      border: 1px solid rgba(201, 162, 39, 0.5);
+      border-radius: 24px;
+      padding: 8px 18px 8px 14px;
+      pointer-events: auto;
+      z-index: 20;
+    }
+    #bgm-panel .icon {
+      font-size: 16px;
+      color: #c9a227;
+      cursor: pointer;
+      user-select: none;
+      line-height: 1;
+    }
+    #bgm-vol {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100px;
+      height: 4px;
+      border-radius: 2px;
+      background: linear-gradient(to right, #c9a227 var(--vol, 20%), #443355 var(--vol, 20%));
+      outline: none;
+      cursor: pointer;
+    }
+    #bgm-vol::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      background: #c9a227;
+      border: 2px solid #1a0a2e;
+      cursor: pointer;
+    }
+    #bgm-vol::-moz-range-thumb {
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      background: #c9a227;
+      border: 2px solid #1a0a2e;
+      cursor: pointer;
+    }
+    #bgm-vol-label {
+      font-family: 'Noto Serif TC', serif;
+      font-size: 11px;
+      color: #887799;
+      min-width: 30px;
+    }
+
+    /* ── 素材庫狀態欄 ── */
+    #asset-panel {
+      position: absolute;
+      top: 10px; right: 10px;
+      background: rgba(8, 4, 20, 0.88);
+      border: 1px solid rgba(107, 47, 160, 0.5);
+      border-radius: 10px;
+      padding: 10px 14px;
+      min-width: 160px;
+      z-index: 30;
+      pointer-events: none;
+      display: none;
+    }
+    #asset-panel .ap-title {
+      font-family: 'Cinzel Decorative', serif;
+      font-size: 9px;
+      color: #c9a227;
+      letter-spacing: 2px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    #asset-panel .ap-row {
+      font-family: 'Noto Serif TC', serif;
+      font-size: 11px;
+      color: #aa99bb;
+      line-height: 1.9;
+      white-space: nowrap;
+    }
+    #asset-panel .ap-row span.ok  { color: #66dd88; }
+    #asset-panel .ap-row span.no  { color: #886699; }
+    #asset-panel .ap-row span.cnt { color: #c9a227; }
+  </style>
+</head>
+<body>
+<div id="game-container"></div>
+
+<!-- BGM 音量控制浮動組件 -->
+<div id="bgm-panel">
+  <span class="icon" id="bgm-mute-btn" title="靜音切換">♪</span>
+  <input type="range" id="bgm-vol" min="0" max="100" value="20" />
+  <span id="bgm-vol-label">20%</span>
+</div>
+
+<!-- 素材庫狀態欄 -->
+<div id="asset-panel">
+  <div class="ap-title">素材庫狀態</div>
+  <div class="ap-row" id="ap-cards">cards.csv：<span class="no">未載入</span></div>
+  <div class="ap-row" id="ap-skills">skills.csv：<span class="no">未載入</span></div>
+  <div class="ap-row" id="ap-dialogue">dialogue.csv：<span class="no">未載入</span></div>
+  <div class="ap-row" id="ap-bgm">BGM：<span class="no">未載入</span></div>
+  <div class="ap-row" id="ap-images">圖片：<span class="no">0 張</span></div>
+  <div class="ap-row" id="ap-sfx">音效：<span class="ok">程式自帶（3 種）</span></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+<script>
+// ════════════════════════════════════════════════════════════
+//  全域資料倉庫（場景間共享）
+// ════════════════════════════════════════════════════════════
+const GameData = {
+  cards:    [],
+  skills:   [],
+  dialogue: [],
+  bgmUrl:   null,
+  images:   {},     // { [image_file]: dataURL }
+};
+
+// ════════════════════════════════════════════════════════════
+//  SfxEngine：Web Audio API 即時合成音效，全域單例
+// ════════════════════════════════════════════════════════════
+class SfxEngine {
+  constructor() {
+    this._ctx = null;
+  }
+
+  _ctx_get() {
+    if (!this._ctx) this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return this._ctx;
+  }
+
+  // 1. 翻牌：短促高頻正弦音（MIDI 感）
+  playFlip() {
+    const ctx = this._ctx_get();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1200, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(800, ctx.currentTime + 0.08);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.12);
+  }
+
+  // 2. SSR 連擊：三音階遞升短音
+  playSsr() {
+    const ctx = this._ctx_get();
+    const freqs = [523.25, 659.25, 783.99]; // C5 E5 G5
+    freqs.forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.13;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, t);
+      gain.gain.setValueAtTime(0.4, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      osc.start(t);
+      osc.stop(t + 0.18);
+    });
+  }
+
+  // 3. 對話選項點擊：低頻短促方波
+  playChoice() {
+    const ctx = this._ctx_get();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(180, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(120, ctx.currentTime + 0.07);
+    gain.gain.setValueAtTime(0.18, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.09);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.09);
+  }
+}
+
+const sfx = new SfxEngine();
+
+// ════════════════════════════════════════════════════════════
+//  AssetPanel：更新右上角素材庫狀態欄
+// ════════════════════════════════════════════════════════════
+class AssetPanel {
+  static show() { document.getElementById('asset-panel').style.display = 'block'; }
+  static hide() { document.getElementById('asset-panel').style.display = 'none'; }
+
+  static refresh() {
+    const set = (id, html) => { document.getElementById(id).innerHTML = html; };
+    const cnt = (n, unit) => `<span class="cnt">${n}</span> ${unit}`;
+    const ok  = (s) => `<span class="ok">${s}</span>`;
+    const no  = (s) => `<span class="no">${s}</span>`;
+
+    set('ap-cards',    `cards.csv：${GameData.cards.length   ? cnt(GameData.cards.length,    '筆角色') : no('未載入')}`);
+    set('ap-skills',   `skills.csv：${GameData.skills.length  ? cnt(GameData.skills.length,   '筆技能') : no('未載入')}`);
+    set('ap-dialogue', `dialogue.csv：${GameData.dialogue.length ? cnt(GameData.dialogue.length, '個節點') : no('未載入')}`);
+    set('ap-bgm',      `BGM：${GameData.bgmUrl ? ok('已載入') : no('未載入')}`);
+    const imgCount = Object.keys(GameData.images).length;
+    set('ap-images',   `圖片：${imgCount ? cnt(imgCount, '張已載入') : no('0 張')}`);
+    set('ap-sfx',      `音效：<span class="ok">程式自帶（3 種）</span>`);
+  }
+
+  // 定位到 canvas 右上角
+  static reposition(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const el = document.getElementById('asset-panel');
+    el.style.right = (window.innerWidth - rect.right + 8) + 'px';
+    el.style.top   = (rect.top + 8) + 'px';
+  }
+}
+
+const assetPanel = AssetPanel;
+
+// ════════════════════════════════════════════════════════════
+//  BgmController：封裝 BGM 播放 / 暫停 / 音量，全域單例
+// ════════════════════════════════════════════════════════════
+class BgmController {
+  constructor() {
+    this._audio  = new Audio();
+    this._audio.loop   = true;
+    this._audio.volume = 0.2;
+    this._muted  = false;
+    this._prevVol = 0.2;
+    this._panel  = document.getElementById('bgm-panel');
+    this._slider = document.getElementById('bgm-vol');
+    this._label  = document.getElementById('bgm-vol-label');
+    this._muteBtn = document.getElementById('bgm-mute-btn');
+    this._setupUI();
+    this._autoLoad();
+  }
+
+  _autoLoad() {
+    fetch('musics/bgm.mp3')
+      .then(r => r.blob())
+      .then(blob => {
+        if (GameData.bgmUrl) URL.revokeObjectURL(GameData.bgmUrl);
+        GameData.bgmUrl = URL.createObjectURL(blob);
+        this._audio.src = GameData.bgmUrl;
+      })
+      .catch(() => {});
+  }
+
+  _setupUI() {
+    this._slider.addEventListener('input', () => {
+      const v = Number(this._slider.value) / 100;
+      this._audio.volume = v;
+      this._muted = v === 0;
+      this._muteBtn.textContent = this._muted ? '🔇' : '♪';
+      this._label.textContent = this._slider.value + '%';
+      this._slider.style.setProperty('--vol', this._slider.value + '%');
+    });
+
+    this._muteBtn.addEventListener('click', () => {
+      if (this._muted) {
+        const restore = this._prevVol > 0 ? this._prevVol : 0.7;
+        this._audio.volume = restore;
+        this._slider.value = Math.round(restore * 100);
+        this._slider.style.setProperty('--vol', Math.round(restore * 100) + '%');
+        this._label.textContent = Math.round(restore * 100) + '%';
+        this._muted = false;
+        this._muteBtn.textContent = '♪';
+      } else {
+        this._prevVol = this._audio.volume;
+        this._audio.volume = 0;
+        this._slider.value = 0;
+        this._slider.style.setProperty('--vol', '0%');
+        this._label.textContent = '0%';
+        this._muted = true;
+        this._muteBtn.textContent = '🔇';
+      }
+    });
+  }
+
+  // 定位 panel 到 canvas 右下角
+  reposition(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    this._panel.style.left   = (rect.right  - 220) + 'px';
+    this._panel.style.top    = (rect.bottom - 52)  + 'px';
+  }
+
+  load(url) {
+    this._audio.src = url;
+  }
+
+  play() {
+    if (!this._audio.src) return;
+    this._audio.play().catch(() => {});
+    this._panel.style.display = 'flex';
+  }
+
+  stop() {
+    this._audio.pause();
+    this._audio.currentTime = 0;
+    this._panel.style.display = 'none';
+  }
+
+  get hasTrack() { return !!GameData.bgmUrl; }
+}
+
+const bgm = new BgmController();
+
+// ── dialogue.csv → 節點 Map ──
+// 欄位：node_id, character, text, choice_a, next_a, choice_b, next_b
+// next_x 為 (END) 時表示劇情結束
+function buildDialogueMap(rows) {
+  const map = {};
+  rows.forEach(r => { map[r.node_id] = r; });
+  return map;
+}
+
+// ── CSV 解析器 ──
+function parseCSV(text) {
+  const lines = text.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const headers = lines[0].split(',').map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const vals = line.split(',').map(v => v.trim());
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = vals[i] ?? ''; });
+    return obj;
+  });
+}
+
+// ── 稀有度數字 → 星星字串 ──
+function rarityStars(n) {
+  return '★'.repeat(Number(n) || 1);
+}
+
+// ── 加權隨機抽卡（依 rarity 欄位）──
+const RARITY_WEIGHTS = { '1': 60, '2': 30, '3': 10 };
+function drawCard() {
+  const pool = [];
+  GameData.cards.forEach(c => {
+    const w = RARITY_WEIGHTS[c.rarity] ?? 10;
+    for (let i = 0; i < w; i++) pool.push(c);
+  });
+  return pool[Math.floor(Math.random() * pool.length)] ?? null;
+}
+
+// ── 圓角矩形路徑 ──
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.lineTo(x + w - r, y);
+  g.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+  g.lineTo(x + w, y + h - r);
+  g.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+  g.lineTo(x + r, y + h);
+  g.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+  g.lineTo(x, y + r);
+  g.arc(x + r, y + r, r, Math.PI, -Math.PI / 2);
+  g.closePath();
+}
+
+// ════════════════════════════════════════════════════════════
+//  場景 1：開始幕
+// ════════════════════════════════════════════════════════════
+class StartScene extends Phaser.Scene {
+  constructor() { super({ key: 'StartScene' }); }
+
+  create() {
+    const { width: W, height: H } = this.scale;
+
+    bgm.stop();
+    AssetPanel.hide();
+
+    // ── 背景 ──
+    const bg = this.add.graphics();
+    bg.fillGradientStyle(0x0a0a1a, 0x0a0a1a, 0x1a0a2e, 0x1a0a2e, 1);
+    bg.fillRect(0, 0, W, H);
+
+    // ── 星點 ──
+    for (let i = 0; i < 120; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(0, H);
+      const r = Math.random() * 1.5 + 0.3;
+      const alpha = Math.random() * 0.7 + 0.2;
+      const star = this.add.graphics();
+      star.fillStyle(0xffd580, alpha);
+      star.fillCircle(x, y, r);
+      this.tweens.add({
+        targets: star,
+        alpha: { from: alpha, to: alpha * 0.2 },
+        duration: Phaser.Math.Between(1500, 4000),
+        yoyo: true, repeat: -1,
+        delay: Phaser.Math.Between(0, 3000),
+      });
+    }
+
+    // ── 光暈 ──
+    const glow = this.add.graphics();
+    glow.fillStyle(0x6b2fa0, 0.15);
+    glow.fillCircle(W / 2, H / 2, 260);
+
+    // ── 副標題 ──
+    this.add.text(W / 2, H / 2 - 155, '✦  CARD SUMMON  ✦', {
+      fontFamily: 'Cinzel Decorative', fontSize: '13px',
+      color: '#c9a227', letterSpacing: 6,
+    }).setOrigin(0.5);
+
+    // ── 主標題 ──
+    const title = this.add.text(W / 2, H / 2 - 96, '卡牌召喚', {
+      fontFamily: 'Noto Serif TC', fontSize: '62px', fontStyle: 'bold',
+      color: '#f5e9c8', stroke: '#6b2fa0', strokeThickness: 6,
+      shadow: { offsetX: 0, offsetY: 4, color: '#6b2fa0', blur: 20, fill: true },
+    }).setOrigin(0.5);
+    this.tweens.add({ targets: title, scaleX: 1.03, scaleY: 1.03, duration: 2200, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+
+    // ── 分隔線 ──
+    const line = this.add.graphics();
+    line.lineStyle(1, 0xc9a227, 0.5);
+    line.lineBetween(W / 2 - 120, H / 2 - 14, W / 2 + 120, H / 2 - 14);
+
+    // ── 狀態文字 ──
+    const statusText = this.add.text(W / 2, H / 2 + 26, '資料載入中…', {
+      fontFamily: 'Noto Serif TC', fontSize: '13px', color: '#8877aa',
+    }).setOrigin(0.5);
+
+    const canvas = this.game.canvas;
+
+    // ── 開始遊戲按鈕（初始隱藏，CSV + 圖片全部載入後顯示）──
+    const startBtnY = H / 2 + 85;
+    const startBg   = this.add.graphics().setAlpha(0);
+    const startTxt  = this.add.text(W / 2, startBtnY, '開始遊戲', {
+      fontFamily: 'Noto Serif TC', fontSize: '20px', fontStyle: 'bold', color: '#f5e9c8',
+    }).setOrigin(0.5).setAlpha(0);
+
+    const drawStartBtn = (hov) => {
+      startBg.clear();
+      startBg.fillStyle(hov ? 0xc9a227 : 0x2a1050, 1);
+      roundRect(startBg, W / 2 - 110, startBtnY - 26, 220, 52, 26);
+      startBg.fillPath();
+      startBg.lineStyle(2, 0xc9a227, 1);
+      roundRect(startBg, W / 2 - 110, startBtnY - 26, 220, 52, 26);
+      startBg.strokePath();
+    };
+    drawStartBtn(false);
+
+    let startEnabled = false;
+    const zone = this.add.zone(W / 2, startBtnY, 220, 52).setInteractive({ useHandCursor: true });
+    zone.on('pointerover', () => { if (!startEnabled) return; drawStartBtn(true);  startTxt.setColor('#1a0a2e'); });
+    zone.on('pointerout',  () => { if (!startEnabled) return; drawStartBtn(false); startTxt.setColor('#f5e9c8'); });
+    zone.on('pointerdown', () => {
+      if (!startEnabled) return;
+      this.cameras.main.fadeOut(500, 0, 0, 0);
+      this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('GameScene'));
+    });
+
+    // ── fetch 三份 CSV，再自動載入所有角色圖片 ──
+    Promise.all([
+      fetch('csvs/cards.csv').then(r => r.text()),
+      fetch('csvs/skills.csv').then(r => r.text()),
+      fetch('csvs/dialogue.csv').then(r => r.text()),
+    ]).then(([cardsText, skillsText, dialogueText]) => {
+      GameData.cards    = parseCSV(cardsText);
+      GameData.skills   = parseCSV(skillsText);
+      GameData.dialogue = parseCSV(dialogueText);
+
+      statusText.setText('🖼 載入角色圖片中…');
+      statusText.setColor('#aaaaee');
+
+      // 收集所有不重複的 image_file
+      const imageFiles = [...new Set(
+        GameData.cards.map(c => c.image_file).filter(Boolean)
+      )];
+
+      const imgPromises = imageFiles.map(filename =>
+        fetch(`images/${filename}`)
+          .then(r => r.blob())
+          .then(blob => new Promise(resolve => {
+            const reader = new FileReader();
+            reader.onload = ev => {
+              GameData.images[filename] = ev.target.result;
+              resolve();
+            };
+            reader.readAsDataURL(blob);
+          }))
+          .catch(() => {})  // 找不到圖片就跳過
+      );
+
+      return Promise.all(imgPromises);
+    }).then(() => {
+      const imgCount = Object.keys(GameData.images).length;
+      statusText.setText(
+        `✅ ${GameData.cards.length} 張卡牌・` +
+        `${GameData.skills.length} 筆技能・` +
+        `${GameData.dialogue.length} 筆對話・` +
+        `${imgCount} 張圖片`
+      );
+      statusText.setColor('#88cc88');
+      startEnabled = true;
+      this.tweens.add({ targets: [startBg, startTxt], alpha: 1, duration: 500, ease: 'Sine.easeOut' });
+    }).catch(err => {
+      statusText.setText('⚠ 資料載入失敗，請確認 csvs/ 與 images/ 資料夾');
+      statusText.setColor('#ff6666');
+      console.error(err);
+    });
+
+    this.cameras.main.fadeIn(600, 0, 0, 0);
+  }
+
+  _drawAudioBtn(g, x, y, hov, loaded) {
+    g.clear();
+    g.fillStyle(loaded ? 0x0e2a1a : (hov ? 0x1a1a40 : 0x0e0a24), 1);
+    roundRect(g, x - 130, y - 22, 260, 44, 22);
+    g.fillPath();
+    g.lineStyle(1.5, loaded ? 0x44cc88 : 0x5544aa, 1);
+    roundRect(g, x - 130, y - 22, 260, 44, 22);
+    g.strokePath();
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  DialogueManager：依節點圖驅動對話，所有邏輯封裝於 class
+// ════════════════════════════════════════════════════════════
+class DialogueManager {
+  /**
+   * @param {Phaser.Scene} scene      - 所屬場景
+   * @param {number} W                - 畫布寬
+   * @param {number} H                - 畫布高
+   * @param {Function} onClose        - 對話結束時的 callback
+   */
+  constructor(scene, W, H, onClose) {
+    this._scene   = scene;
+    this._W       = W;
+    this._H       = H;
+    this._onClose = onClose;
+    this._nodeMap = buildDialogueMap(GameData.dialogue);
+    this._active  = false;
+
+    // ── 對話框容器（深度最高，蓋在卡牌之上）──
+    this._root = scene.add.container(0, H).setDepth(100);
+
+    // 對話框總高度 = 名牌(30) + 內容區(220)
+    const nameH = 30;
+    const boxH  = 220;
+
+    // 半透明黑底（從 y=0 開始，含名牌列）
+    const panel = scene.add.graphics();
+    panel.fillStyle(0x000000, 0.88);
+    panel.fillRect(0, 0, W, nameH + boxH);
+    panel.lineStyle(1, 0x6b2fa0, 0.6);
+    panel.lineBetween(0, 0, W, 0);
+
+    // 說話者名牌背景（在面板頂端內部）
+    const nameBg = scene.add.graphics();
+    nameBg.fillStyle(0x2a1050, 1);
+    nameBg.fillRoundedRect(16, 4, 130, nameH - 4, 8);
+    nameBg.lineStyle(1, 0xc9a227, 0.8);
+    nameBg.strokeRoundedRect(16, 4, 130, nameH - 4, 8);
+
+    this._speakerText = scene.add.text(81, nameH / 2 + 2, '', {
+      fontFamily: 'Noto Serif TC', fontSize: '13px',
+      fontStyle: 'bold', color: '#c9a227',
+    }).setOrigin(0.5);
+
+    // 台詞文字在名牌下方
+    this._bodyText = scene.add.text(20, nameH + 12, '', {
+      fontFamily: 'Noto Serif TC', fontSize: '16px',
+      color: '#f0e8d0', wordWrap: { width: W - 40 }, lineSpacing: 6,
+    });
+
+    // 選項按鈕
+    this._choiceBtns = [
+      this._makeChoiceBtn(W / 2 - 6, nameH + 106, 'left'),
+      this._makeChoiceBtn(W / 2 + 6, nameH + 106, 'right'),
+    ];
+
+    // 繼續提示
+    this._continueHint = scene.add.text(W - 20, nameH + boxH - 12, '▶', {
+      fontFamily: 'Noto Serif TC', fontSize: '14px', color: '#887799',
+    }).setOrigin(1, 1);
+    scene.tweens.add({
+      targets: this._continueHint, alpha: 0.2, duration: 700,
+      yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+    });
+
+    // 點擊台詞區推進（名牌下方到選項區之間）
+    const hitZone = scene.add.zone(W / 2, nameH + 54, W, 108).setInteractive();
+    hitZone.on('pointerdown', () => {
+      if (this._active && !this._hasChoices) this._advance();
+    });
+    this._hitZone = hitZone;
+
+    this._root.add([panel, nameBg, this._speakerText, this._bodyText,
+      ...this._choiceBtns.flatMap(b => [b.bg, b.txt, b.zone]),
+      this._continueHint,
+      hitZone]);
+  }
+
+  // ── 建立選項按鈕（左／右） ──
+  _makeChoiceBtn(x, y, side) {
+    const bW = 196, bH = 44, r = 22;
+    const ox = side === 'left' ? -bW : 0;
+    const bg = this._scene.add.graphics();
+    const txt = this._scene.add.text(x + ox + bW / 2, y + bH / 2, '', {
+      fontFamily: 'Noto Serif TC', fontSize: '14px',
+      fontStyle: 'bold', color: '#f5e9c8',
+      wordWrap: { width: bW - 20 }, align: 'center',
+    }).setOrigin(0.5);
+    const zone = this._scene.add.zone(x + ox + bW / 2, y + bH / 2, bW, bH).setInteractive({ useHandCursor: true });
+
+    const drawBg = (hov) => {
+      bg.clear();
+      bg.fillStyle(hov ? 0x5a3090 : 0x2a1050, 1);
+      bg.fillRoundedRect(x + ox, y, bW, bH, r);
+      bg.lineStyle(1.5, 0xc9a227, 0.8);
+      bg.strokeRoundedRect(x + ox, y, bW, bH, r);
+    };
+    drawBg(false);
+    zone.on('pointerover', () => drawBg(true));
+    zone.on('pointerout',  () => drawBg(false));
+
+    return { bg, txt, zone, drawBg, ox, bW, bH, baseX: x, baseY: y };
+  }
+
+  // ── 開始對話，從指定 node_id 出發 ──
+  start(startNodeId) {
+    this._active     = true;
+    this._hasChoices = false;
+    this._scene.tweens.add({
+      targets: this._root, y: this._H - 250,
+      duration: 320, ease: 'Cubic.easeOut',
+    });
+    this._showNode(startNodeId);
+  }
+
+  // ── 顯示節點 ──
+  _showNode(nodeId) {
+    if (nodeId === '(END)' || !nodeId) {
+      this._close();
+      return;
+    }
+    if (!this._nodeMap[nodeId]) {
+      // 節點不存在時顯示結束提示，點擊關閉
+      this._bodyText.setText('（對話結束）');
+      this._speakerText.setText('');
+      this._hasChoices = false;
+      this._continueHint.setVisible(true);
+      this._hitZone.setInteractive();
+      this._hideChoices();
+      this._currentNode = { next_a: '(END)' };
+      return;
+    }
+
+    const node = this._nodeMap[nodeId];
+    this._currentNode = node;
+
+    // 查角色顯示名稱（從 cards 找）
+    const cardRow = GameData.cards.find(c => c.card_id === node.character);
+    const speaker = cardRow ? cardRow.card_name : node.character;
+    this._speakerText.setText(speaker);
+    this._bodyText.setText(node.text);
+
+    const hasA = node.choice_a && node.choice_a.trim() !== '';
+    const hasB = node.choice_b && node.choice_b.trim() !== '';
+    this._hasChoices = hasA || hasB;
+
+    if (this._hasChoices) {
+      this._continueHint.setVisible(false);
+      this._hitZone.disableInteractive();
+      this._showChoices(node, hasA, hasB);
+    } else {
+      this._continueHint.setVisible(true);
+      this._hitZone.setInteractive();
+      this._hideChoices();
+    }
+  }
+
+  // ── 顯示選項 ──
+  _showChoices(node, hasA, hasB) {
+    const W = this._W;
+    const boxY = 0;
+
+    // 單選項置中，雙選項左右分佈
+    const count = (hasA ? 1 : 0) + (hasB ? 1 : 0);
+    const configs = [];
+    if (hasA) configs.push({ label: node.choice_a, next: node.next_a });
+    if (hasB) configs.push({ label: node.choice_b, next: node.next_b });
+
+    configs.forEach((cfg, i) => {
+      const btn = this._choiceBtns[i];
+      const bW = count === 1 ? 280 : 196;
+      const startX = count === 1 ? (W - bW) / 2 : (i === 0 ? 12 : W / 2 + 6);
+
+      btn.bg.clear();
+      btn.bg.fillStyle(0x2a1050, 1);
+      btn.bg.fillRoundedRect(startX, 138, bW, 44, 22);
+      btn.bg.lineStyle(1.5, 0xc9a227, 0.8);
+      btn.bg.strokeRoundedRect(startX, 138, bW, 44, 22);
+      btn.bg.setVisible(true);
+
+      btn.txt.setText(cfg.label);
+      btn.txt.setPosition(startX + bW / 2, 160);
+      btn.txt.setVisible(true);
+
+      btn.zone.setPosition(startX + bW / 2, 160);
+      btn.zone.setSize(bW, 44);
+      btn.zone.setVisible(true);
+
+      btn.zone.removeAllListeners('pointerdown');
+      const nextId = cfg.next;
+      btn.zone.on('pointerdown', () => {
+        if (!this._active) return;
+        sfx.playChoice();  // 對話選項音效
+        this._scene.tweens.add({ targets: [btn.bg, btn.txt], scaleX: 0.95, scaleY: 0.95, duration: 70, yoyo: true });
+        this._scene.time.delayedCall(100, () => this._showNode(nextId));
+      });
+    });
+
+    // 隱藏多餘的按鈕
+    for (let i = configs.length; i < this._choiceBtns.length; i++) {
+      this._choiceBtns[i].bg.setVisible(false);
+      this._choiceBtns[i].txt.setVisible(false);
+      this._choiceBtns[i].zone.setVisible(false);
+    }
+  }
+
+  // ── 隱藏所有選項按鈕 ──
+  _hideChoices() {
+    this._choiceBtns.forEach(b => {
+      b.bg.setVisible(false);
+      b.txt.setVisible(false);
+      b.zone.setVisible(false);
+    });
+  }
+
+  // ── 無選項時點擊推進 ──
+  _advance() {
+    const next = this._currentNode?.next_a?.trim();
+    if (!next || next === '(END)') { this._close(); return; }
+    this._showNode(next);
+  }
+
+  // ── 關閉對話框 ──
+  _close() {
+    this._active = false;
+    this._hideChoices();
+    this._scene.tweens.add({
+      targets: this._root, y: this._H,
+      duration: 300, ease: 'Cubic.easeIn',
+      onComplete: () => { if (this._onClose) this._onClose(); },
+    });
+  }
+
+  get active() { return this._active; }
+}
+
+// ════════════════════════════════════════════════════════════
+//  場景 2：遊戲中幕
+// ════════════════════════════════════════════════════════════
+class GameScene extends Phaser.Scene {
+  constructor() { super({ key: 'GameScene' }); }
+
+  create() {
+    const { width: W, height: H } = this.scale;
+
+    this._hand = [null, null];
+
+    // ── BGM 開始播放 + 素材庫狀態欄 ──
+    bgm.reposition(this.game.canvas);
+    bgm.play();
+    AssetPanel.reposition(this.game.canvas);
+    AssetPanel.refresh();
+    AssetPanel.show();
+
+    // ── 背景 ──
+    const bg = this.add.graphics();
+    bg.fillGradientStyle(0x0f0820, 0x0f0820, 0x1c0d3a, 0x1c0d3a, 1);
+    bg.fillRect(0, 0, W, H);
+
+    for (let i = 0; i < 60; i++) {
+      const sg = this.add.graphics();
+      sg.fillStyle(0xd4b8ff, Math.random() * 0.35 + 0.08);
+      sg.fillCircle(Phaser.Math.Between(0, W), Phaser.Math.Between(0, H), Math.random() * 1.2 + 0.3);
+    }
+
+    // ── 標題列 ──
+    this.add.text(W / 2, 30, '— 卡牌召喚 —', {
+      fontFamily: 'Noto Serif TC', fontSize: '16px', color: '#c9a227', letterSpacing: 4,
+    }).setOrigin(0.5);
+
+    // ── 攻擊力顯示 ──
+    this._atkText = this.add.text(W / 2, 58, '', {
+      fontFamily: 'Noto Serif TC', fontSize: '13px', color: '#aaaaff',
+    }).setOrigin(0.5);
+
+    // ── 組合提示文字 ──
+    this._comboText = this.add.text(W / 2, H - 240, '', {
+      fontFamily: 'Noto Serif TC', fontSize: '13px', color: '#ffdd88',
+      wordWrap: { width: W - 40 }, align: 'center',
+    }).setOrigin(0.5);
+
+    // ── 提示：點擊卡牌對話 ──
+    this._hintText = this.add.text(W / 2, H - 215, '點擊卡牌可觸發對話', {
+      fontFamily: 'Noto Serif TC', fontSize: '11px', color: '#554477',
+    }).setOrigin(0.5);
+
+    // ── 卡槽 ──
+    this._slotContainers = [];
+    const slotY  = H / 2 - 40;
+    const slot0X = W / 2 - 130;
+    const slot1X = W / 2 + 130;
+    for (let i = 0; i < 2; i++) {
+      this._slotContainers.push(this._buildEmptySlot(i === 0 ? slot0X : slot1X, slotY, i));
+    }
+
+    // ── 對話管理器 ──
+    this._dialogue = new DialogueManager(this, W, H, () => {
+      // 對話結束後恢復提示
+      this._hintText.setVisible(true);
+    });
+
+    // ── 抽卡按鈕 ──
+    this._makeDrawBtn(W / 2, H - 185);
+
+    // ── 結束按鈕 ──
+    this._makeEndBtn(W - 55, 30);
+
+    this.cameras.main.fadeIn(500, 0, 0, 0);
+  }
+
+  // ── 建立空卡槽 ──
+  _buildEmptySlot(x, y, idx) {
+    const CW = 160, CH = 240, CR = 14;
+    const cont = this.add.container(x, y);
+    const slotBg = this.add.graphics();
+    slotBg.lineStyle(1.5, 0x554488, 0.5);
+    slotBg.fillStyle(0x1a0d30, 0.4);
+    roundRect(slotBg, -CW / 2, -CH / 2, CW, CH, CR);
+    slotBg.fillPath();
+    roundRect(slotBg, -CW / 2, -CH / 2, CW, CH, CR);
+    slotBg.strokePath();
+    const slotLabel = this.add.text(0, 0, `卡槽 ${idx + 1}`, {
+      fontFamily: 'Noto Serif TC', fontSize: '14px', color: '#443366', fontStyle: 'bold',
+    }).setOrigin(0.5);
+    cont.add([slotBg, slotLabel]);
+    cont.setAlpha(0.6);
+    return cont;
+  }
+
+  // ── 渲染卡牌到卡槽，並綁定點擊對話 ──
+  _renderCard(idx, cardData) {
+    const { width: W, height: H } = this.scale;
+    const CW = 160, CH = 240, CR = 14;
+    const slotY = H / 2 - 40;
+    const x = idx === 0 ? W / 2 - 130 : W / 2 + 130;
+
+    this._slotContainers[idx].destroy();
+    const cont = this.add.container(x, slotY);
+
+    const shadow = this.add.graphics();
+    shadow.fillStyle(0x000000, 0.4);
+    roundRect(shadow, -CW / 2 + 6, -CH / 2 + 8, CW, CH, CR);
+    shadow.fillPath();
+
+    const card = this.add.graphics();
+    card.fillStyle(0xfaf6ed, 1);
+    roundRect(card, -CW / 2, -CH / 2, CW, CH, CR);
+    card.fillPath();
+    card.lineStyle(1.5, 0xc9a227, 0.8);
+    roundRect(card, -CW / 2 + 6, -CH / 2 + 6, CW - 12, CH - 12, CR - 3);
+    card.strokePath();
+
+    const hdr = this.add.graphics();
+    hdr.fillStyle(0x2a1050, 1);
+    roundRect(hdr, -CW / 2, -CH / 2, CW, 44, CR);
+    hdr.fillPath();
+    hdr.fillRect(-CW / 2, -CH / 2 + 30, CW, 14);
+
+    const nameT = this.add.text(0, -CH / 2 + 22, cardData.card_name, {
+      fontFamily: 'Noto Serif TC', fontSize: '16px', fontStyle: 'bold',
+      color: '#f5e9c8', stroke: '#6b2fa0', strokeThickness: 2,
+    }).setOrigin(0.5);
+
+    const starsT = this.add.text(0, -CH / 2 + 68, rarityStars(cardData.rarity), {
+      fontFamily: 'Noto Serif TC', fontSize: '18px',
+      color: '#c9a227', stroke: '#7a5200', strokeThickness: 1,
+    }).setOrigin(0.5);
+
+    // 插圖區底板
+    const illus = this.add.graphics();
+    illus.fillStyle(0xf0e8d4, 0.5);
+    illus.fillRoundedRect(-52, -CH / 2 + 88, 104, 80, 6);
+
+    // 角色圖片（以 image_file 對應，center-crop 裁切）
+    const imgKey = `card_img_${cardData.card_id}`;
+    const imgDataUrl = GameData.images[cardData.image_file];
+    let icon;
+    if (imgDataUrl && !this.textures.exists(imgKey)) {
+      const tmpImg = new Image();
+      tmpImg.onload = () => {
+        // 以 canvas 做 center-crop：目標 104×80
+        const tw = 104, th = 80;
+        const offscreen = document.createElement('canvas');
+        offscreen.width = tw; offscreen.height = th;
+        const oc = offscreen.getContext('2d');
+        const scale = Math.max(tw / tmpImg.width, th / tmpImg.height);
+        const sw = tmpImg.width * scale, sh = tmpImg.height * scale;
+        // 水平置中、垂直從頂部對齊（底部超出即裁切）
+        oc.drawImage(tmpImg, (tw - sw) / 2, 0, sw, sh);
+        this.textures.addBase64(imgKey, offscreen.toDataURL());
+      };
+      tmpImg.src = imgDataUrl;
+    }
+    if (imgDataUrl && this.textures.exists(imgKey)) {
+      icon = this.add.image(0, -CH / 2 + 128, imgKey).setDisplaySize(104, 80);
+    } else if (imgDataUrl) {
+      // 圖片尚未轉入 texture，先用 emoji 佔位，等 texture 建立後下次抽卡會更新
+      icon = this.add.text(0, -CH / 2 + 128, '👤', { fontSize: '30px' }).setOrigin(0.5);
+      // texture ready event
+      this.textures.once('addtexture-' + imgKey, () => {
+        if (!cont.active) return;
+        icon.destroy();
+        const img = this.add.image(0, -CH / 2 + 128, imgKey).setDisplaySize(104, 80);
+        cont.add(img);
+      });
+    } else {
+      icon = this.add.text(0, -CH / 2 + 128, '👤', { fontSize: '30px' }).setOrigin(0.5);
+    }
+
+    const skillData = GameData.skills.find(s => s.card_id === cardData.card_id);
+    const skillLabel = this.add.text(0, -CH / 2 + 178, skillData ? `【${skillData.effect_stat}】` : '—', {
+      fontFamily: 'Noto Serif TC', fontSize: '11px', color: '#6b2fa0', fontStyle: 'bold',
+    }).setOrigin(0.5);
+
+    const atkLabel = this.add.text(0, -CH / 2 + 200, `ATK ${cardData.base_attack}`, {
+      fontFamily: 'Noto Serif TC', fontSize: '13px', color: '#334488', fontStyle: 'bold',
+    }).setOrigin(0.5);
+
+    // ── 可點擊互動區（整張卡牌大小）──
+    const hitZone = this.add.zone(0, 0, CW, CH).setInteractive({ useHandCursor: true });
+    hitZone.on('pointerdown', () => {
+      if (this._dialogue.active) return;
+      // 找該卡的起始對話節點（node_id 格式：{card_id}_start）
+      const startNode = cardData.card_id + '_start';
+      if (!GameData.dialogue.find(d => d.node_id === startNode)) return;
+      this._hintText.setVisible(false);
+      this._dialogue.start(startNode);
+    });
+    hitZone.on('pointerover', () => {
+      this.tweens.add({ targets: cont, scaleX: 1.04, scaleY: 1.04, duration: 120, ease: 'Sine.easeOut' });
+    });
+    hitZone.on('pointerout', () => {
+      this.tweens.add({ targets: cont, scaleX: 1, scaleY: 1, duration: 120, ease: 'Sine.easeOut' });
+    });
+
+    cont.add([shadow, card, hdr, nameT, starsT, illus, icon, skillLabel, atkLabel, hitZone]);
+
+    cont.setAlpha(0);
+    cont.y += 30;
+    this.tweens.add({ targets: cont, alpha: 1, y: slotY, duration: 500, ease: 'Back.easeOut' });
+    this.tweens.add({
+      targets: cont, y: slotY - 6, duration: 2200, yoyo: true, repeat: -1,
+      ease: 'Sine.easeInOut', delay: 600,
+    });
+
+    this._slotContainers[idx] = cont;
+  }
+
+  // ── 抽卡邏輯 ──
+  _doDraw() {
+    if (this._dialogue.active) return;
+    const card = drawCard();
+    if (!card) return;
+    sfx.playFlip();   // 翻牌音效
+    let targetIdx = this._hand.findIndex(h => h === null);
+    if (targetIdx === -1) targetIdx = 0;
+    this._hand[targetIdx] = card;
+    this._renderCard(targetIdx, card);
+    this._checkCombo();
+    AssetPanel.refresh();
+  }
+
+  // ── 組合觸發檢查 ──
+  _checkCombo() {
+    const [c0, c1] = this._hand;
+    if (!c0 || !c1) { this._atkText.setText(''); this._comboText.setText(''); return; }
+
+    let totalAtk = (Number(c0.base_attack) || 0) + (Number(c1.base_attack) || 0);
+    let comboMsg = '';
+
+    [{ owner: c0, partner: c1 }, { owner: c1, partner: c0 }].forEach(({ owner, partner }) => {
+      const skill = GameData.skills.find(s => s.card_id === owner.card_id);
+      if (!skill || skill.trigger !== partner.card_id) return;
+      const val = Number(skill.effect_value) || 1;
+      let boosted = Number(owner.base_attack) || 0;
+      if (skill.effect_op === 'multiply') boosted *= val;
+      else if (skill.effect_op === 'add')  boosted += val;
+      else if (skill.effect_op === 'set')  boosted  = val;
+      totalAtk = totalAtk - (Number(owner.base_attack) || 0) + boosted;
+      const newRarityNum = { SSR: 4, UR: 5 }[skill.unlock_rarity] ?? Number(skill.unlock_rarity) ?? 3;
+      comboMsg += `✦ 組合觸發！${owner.card_name} ${skill.effect_stat} `
+        + `${skill.effect_op === 'multiply' ? '×' : '+'}${val}`
+        + `，解鎖 ${skill.unlock_rarity}（${rarityStars(newRarityNum)}）\n`;
+    });
+
+    this._atkText.setText(`合計攻擊力：${totalAtk}`);
+    this._comboText.setText(comboMsg.trim());
+    if (comboMsg) {
+      sfx.playSsr();  // SSR 連擊音效
+      this.tweens.add({ targets: this._comboText, scaleX: 1.06, scaleY: 1.06, duration: 180, yoyo: true });
+    }
+  }
+
+  // ── 抽卡按鈕 ──
+  _makeDrawBtn(x, y) {
+    const btnW = 200, btnH = 48, r = 24;
+    const bg2 = this.add.graphics();
+    const draw = (hov) => {
+      bg2.clear();
+      bg2.fillStyle(hov ? 0xc9a227 : 0x2a1050, 1);
+      roundRect(bg2, x - btnW / 2, y - btnH / 2, btnW, btnH, r);
+      bg2.fillPath();
+      bg2.lineStyle(2, 0xc9a227, 1);
+      roundRect(bg2, x - btnW / 2, y - btnH / 2, btnW, btnH, r);
+      bg2.strokePath();
+    };
+    draw(false);
+    const txt = this.add.text(x, y, '✦ 抽卡', {
+      fontFamily: 'Noto Serif TC', fontSize: '19px', fontStyle: 'bold', color: '#f5e9c8',
+    }).setOrigin(0.5);
+    const zone = this.add.zone(x, y, btnW, btnH).setInteractive({ useHandCursor: true });
+    zone.on('pointerover', () => { draw(true); txt.setColor('#1a0a2e'); });
+    zone.on('pointerout',  () => { draw(false); txt.setColor('#f5e9c8'); });
+    zone.on('pointerdown', () => {
+      this.tweens.add({ targets: [bg2, txt], scaleX: 0.93, scaleY: 0.93, duration: 80, yoyo: true });
+      this._doDraw();
+    });
+  }
+
+  // ── 結束按鈕 ──
+  _makeEndBtn(x, y) {
+    const btnW = 80, btnH = 32, r = 16;
+    const bg2 = this.add.graphics();
+    const draw = (hov) => {
+      bg2.clear();
+      bg2.fillStyle(hov ? 0x8b0000 : 0x2a0010, 1);
+      roundRect(bg2, x - btnW / 2, y - btnH / 2, btnW, btnH, r);
+      bg2.fillPath();
+      bg2.lineStyle(1, 0xff4444, 0.6);
+      roundRect(bg2, x - btnW / 2, y - btnH / 2, btnW, btnH, r);
+      bg2.strokePath();
+    };
+    draw(false);
+    const txt = this.add.text(x, y, '結束', {
+      fontFamily: 'Noto Serif TC', fontSize: '14px', fontStyle: 'bold', color: '#ffaaaa',
+    }).setOrigin(0.5);
+    const zone = this.add.zone(x, y, btnW, btnH).setInteractive({ useHandCursor: true });
+    zone.on('pointerover', () => { draw(true); txt.setColor('#fff'); });
+    zone.on('pointerout',  () => { draw(false); txt.setColor('#ffaaaa'); });
+    zone.on('pointerdown', () => {
+      this.cameras.main.fadeOut(500, 0, 0, 0);
+      this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('EndScene'));
+    });
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  場景 3：結束幕
+// ════════════════════════════════════════════════════════════
+class EndScene extends Phaser.Scene {
+  constructor() { super({ key: 'EndScene' }); }
+
+  create() {
+    const { width: W, height: H } = this.scale;
+
+    bgm.stop();
+    AssetPanel.hide();
+
+    const bg = this.add.graphics();
+    bg.fillGradientStyle(0x0a0a0a, 0x0a0a0a, 0x1a0505, 0x1a0505, 1);
+    bg.fillRect(0, 0, W, H);
+
+    const glow = this.add.graphics();
+    glow.fillStyle(0x8b0000, 0.12);
+    glow.fillCircle(W / 2, H / 2, 240);
+
+    for (let i = 0; i < 60; i++) {
+      const sg = this.add.graphics();
+      sg.fillStyle(0xff6666, Math.random() * 0.2 + 0.05);
+      sg.fillCircle(Phaser.Math.Between(0, W), Phaser.Math.Between(0, H), Math.random() + 0.5);
+    }
+
+    const deco = this.add.graphics();
+    deco.lineStyle(1, 0x8b0000, 0.4);
+    deco.lineBetween(W / 2 - 140, H / 2 - 20, W / 2 + 140, H / 2 - 20);
+    deco.lineBetween(W / 2 - 140, H / 2 + 20, W / 2 + 140, H / 2 + 20);
+
+    const endText = this.add.text(W / 2, H / 2 - 70, '遊戲結束', {
+      fontFamily: 'Noto Serif TC', fontSize: '58px', fontStyle: 'bold',
+      color: '#f5c0c0', stroke: '#8b0000', strokeThickness: 5,
+      shadow: { offsetX: 0, offsetY: 6, color: '#8b0000', blur: 24, fill: true },
+    }).setOrigin(0.5).setAlpha(0);
+
+    this.tweens.add({ targets: endText, alpha: 1, y: '-=10', duration: 800, ease: 'Sine.easeOut', delay: 200 });
+    this.tweens.add({ targets: endText, scaleX: 1.02, scaleY: 1.02, duration: 3000, yoyo: true, repeat: -1, ease: 'Sine.easeInOut', delay: 1000 });
+
+    const sub = this.add.text(W / 2, H / 2 + 10, 'GAME OVER', {
+      fontFamily: 'Cinzel Decorative', fontSize: '12px', color: '#aa4444', letterSpacing: 8,
+    }).setOrigin(0.5).setAlpha(0);
+    this.tweens.add({ targets: sub, alpha: 0.8, duration: 600, delay: 700 });
+
+    this._makeRestartBtn(W / 2, H / 2 + 100);
+    this.cameras.main.fadeIn(600, 0, 0, 0);
+  }
+
+  _makeRestartBtn(x, y) {
+    const btnW = 220, btnH = 52, r = 26;
+    const bg2 = this.add.graphics().setAlpha(0);
+    const draw = (hov) => {
+      bg2.clear();
+      bg2.fillStyle(hov ? 0xc9a227 : 0x2a1050, 1);
+      roundRect(bg2, x - btnW / 2, y - btnH / 2, btnW, btnH, r);
+      bg2.fillPath();
+      bg2.lineStyle(2, hov ? 0xffd700 : 0xc9a227, 1);
+      roundRect(bg2, x - btnW / 2, y - btnH / 2, btnW, btnH, r);
+      bg2.strokePath();
+    };
+    draw(false);
+    const txt = this.add.text(x, y, '重新開始', {
+      fontFamily: 'Noto Serif TC', fontSize: '20px', fontStyle: 'bold', color: '#f5e9c8',
+    }).setOrigin(0.5).setAlpha(0);
+    this.tweens.add({ targets: [bg2, txt], alpha: 1, duration: 500, delay: 900 });
+
+    const zone = this.add.zone(x, y, btnW, btnH).setInteractive({ useHandCursor: true });
+    zone.on('pointerover', () => { draw(true); txt.setColor('#1a0a2e'); });
+    zone.on('pointerout',  () => { draw(false); txt.setColor('#f5e9c8'); });
+    zone.on('pointerdown', () => {
+      this.tweens.add({ targets: [bg2, txt], scaleX: 0.94, scaleY: 0.94, duration: 80, yoyo: true });
+      this.cameras.main.fadeOut(500, 0, 0, 0);
+      this.cameras.main.once('camerafadeoutcomplete', () => this.scene.start('StartScene'));
+    });
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  Phaser 設定
+// ════════════════════════════════════════════════════════════
+const config = {
+  type: Phaser.AUTO,
+  width: 480,
+  height: 720,
+  backgroundColor: '#0a0a0f',
+  parent: 'game-container',
+  scene: [StartScene, GameScene, EndScene],
+};
+
+new Phaser.Game(config);
+</script>
+</body>
+</html>
